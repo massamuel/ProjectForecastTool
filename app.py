@@ -1,17 +1,21 @@
-import csv, io, json, math, os, re, sqlite3, threading
-from concurrent.futures import ThreadPoolExecutor
+import csv, hmac, io, json, math, os, re, sqlite3
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).parent
 DB = Path(os.environ.get('FORECAST_DB', str(ROOT / 'forecast.sqlite3')))
-INGEST_LIMIT = threading.BoundedSemaphore(2)
 
+@contextmanager
 def connect():
     db = sqlite3.connect(DB, timeout=20)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
-    return db
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
 
 def init():
     with connect() as db:
@@ -80,11 +84,13 @@ def perform(path, data):
         if path == '/api/ingest':
             docs=data['documents']
             if not isinstance(docs,list) or not 1<=len(docs)<=20: raise ValueError('Upload 1–20 documents at a time')
-            with INGEST_LIMIT:
-                with ThreadPoolExecutor(max_workers=4) as pool:
-                    groups=list(pool.map(chunk_document,docs))
+            # Go owns concurrency. Each call is one atomic upload operation.
+            for doc in docs:
+                if not isinstance(doc, dict) or not isinstance(doc.get('name'), str) or not isinstance(doc.get('text'), str):
+                    raise ValueError('Each document needs a name and text')
+            groups = [chunk_document(doc) for doc in docs]
             db.executemany('INSERT INTO chunks(project_id,source,position,text) VALUES(?,?,?,?)',[(pid,*row) for group in groups for row in group])
-            return {'chunks':sum(map(len,groups)), 'workers':4}
+            return {'chunks':sum(map(len,groups))}
         if path == '/api/search':
             terms=set(re.findall(r'\w+',str(data.get('query','')).lower()))
             if not terms: raise ValueError('Enter a search question')
@@ -111,13 +117,19 @@ def perform(path, data):
 class Handler(BaseHTTPRequestHandler):
     def reply(self,value,status=200):
         body=json.dumps(value).encode(); self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+    def authorized(self):
+        token = os.environ.get('FORECAST_INTERNAL_TOKEN')
+        return token and hmac.compare_digest(self.headers.get('X-Internal-Token', ''), token)
     def do_GET(self):
+        if not self.authorized(): return self.reply({'error':'Internal service token required'},403)
+        if self.path == '/health': return self.reply({'status':'ok'})
         if self.path=='/':
             body=(ROOT/'index.html').read_bytes(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.end_headers(); self.wfile.write(body); return
         with connect() as db:
             if self.path=='/api/state': return self.reply({'projects':[forecast(db,r[0]) for r in db.execute('SELECT id FROM projects ORDER BY id DESC')]})
         self.reply({'error':'Not found'},404)
     def do_POST(self):
+        if not self.authorized(): return self.reply({'error':'Internal service token required'},403)
         try:
             # Local app: reject cross-origin browser writes.
             origin=self.headers.get('Origin')
@@ -129,5 +141,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception: self.reply({'error':'Internal error; check server console'},500); import traceback; traceback.print_exc()
 
 if __name__=='__main__':
-    init(); port=int(os.environ.get('PORT','8765')); print('ProjectForecast running at http://127.0.0.1:'+str(port),flush=True)
+    if not os.environ.get('FORECAST_INTERNAL_TOKEN'): raise SystemExit('Use python3 run.py to start the Go backend and Python service')
+    init(); port=int(os.environ.get('PYTHON_PORT','8766')); print('Python service on http://127.0.0.1:'+str(port),flush=True)
     ThreadingHTTPServer(('127.0.0.1',port),Handler).serve_forever()
