@@ -1,0 +1,8 @@
+# Intel macOS uses the last available PyTorch wheel; keep NumPy ABI compatible.
+chromadb==0.5.23
+sentence-transformers==3.4.1
+transformers==4.46.3
+torch==2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'
+torch>=2.2,<3; sys_platform != 'darwin' or platform_machine != 'x86_64'
+numpy>=1.26,<2
+posthog>=2.4,<4

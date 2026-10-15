@@ -1,17 +1,25 @@
 import csv, io, json, math, os, re, sqlite3, threading
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from rag.config import Config
+from rag.pipeline import Pipeline
+from rag.embeddings import Unavailable
+from rag.generation import InvalidGeneration
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).parent
 DB = Path(os.environ.get('FORECAST_DB', str(ROOT / 'forecast.sqlite3')))
-INGEST_LIMIT = threading.BoundedSemaphore(2)
 
+@contextmanager
 def connect():
     db = sqlite3.connect(DB, timeout=20)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
-    return db
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
 
 def init():
     with connect() as db:
@@ -20,17 +28,34 @@ def init():
         CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, project_id INTEGER REFERENCES projects(id), source TEXT, position INTEGER, text TEXT);
         CREATE TABLE IF NOT EXISTS changes(id INTEGER PRIMARY KEY, project_id INTEGER REFERENCES projects(id), description TEXT, hours REAL, approved INTEGER DEFAULT 0, chunk_id INTEGER REFERENCES chunks(id));''')
 
+        # Additive migration: existing project/time/scope data remains usable.
+        existing = {r[1] for r in db.execute('PRAGMA table_info(chunks)')}
+        columns = {'document_id':"TEXT NOT NULL DEFAULT ''", 'section':"TEXT NOT NULL DEFAULT 'Document'",
+                   'line_start':'INTEGER NOT NULL DEFAULT 1','line_end':'INTEGER NOT NULL DEFAULT 1',
+                   'token_count':'INTEGER NOT NULL DEFAULT 0'}
+        for name, definition in columns.items():
+            if name not in existing: db.execute('ALTER TABLE chunks ADD COLUMN '+name+' '+definition)
+        db.executescript('''CREATE TABLE IF NOT EXISTS rag_documents(id TEXT PRIMARY KEY, project_id INTEGER REFERENCES projects(id), name TEXT NOT NULL, text TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS rag_index_state(project_id INTEGER PRIMARY KEY REFERENCES projects(id), signature TEXT NOT NULL, collection TEXT NOT NULL);''')
+
+_PIPELINE = None
+_PIPELINE_KEY = None
+_PIPELINE_LOCK = threading.Lock()
+
+def get_pipeline():
+    global _PIPELINE, _PIPELINE_KEY
+    key = str(DB.resolve())
+    with _PIPELINE_LOCK:
+        if _PIPELINE is None or _PIPELINE_KEY != key:
+            _PIPELINE = Pipeline(Config.from_env(ROOT), connect, DB)
+            _PIPELINE_KEY = key
+        return _PIPELINE
+
 def number(data, key, default=0, positive=False):
     value = float(data.get(key, default))
     if not math.isfinite(value) or value < 0 or (positive and value == 0):
         raise ValueError(key + ' must be a finite ' + ('positive' if positive else 'nonnegative') + ' number')
     return value
-
-def chunk_document(doc):
-    name = str(doc.get('name', 'Document'))[:200]
-    words = str(doc.get('text', '')).split()
-    if not words: raise ValueError('Document cannot be empty')
-    return [(name, i // 180, ' '.join(words[i:i+220])) for i in range(0, len(words), 180)]
 
 def forecast(db, pid):
     p = db.execute('SELECT * FROM projects WHERE id=?', (pid,)).fetchone()
@@ -47,6 +72,13 @@ def forecast(db, pid):
     return dict(p, actual=actual, scope_delta=delta, pace_factor=factor, remaining=remaining, final_hours=final, final_cost=cost, budget_variance=p['budget']-cost, low_cost=(actual+remaining*.8)*p['rate'], high_cost=(actual+remaining*1.3)*p['rate'], changes=changes, documents=db.execute('SELECT COUNT(DISTINCT source) FROM chunks WHERE project_id=?',(pid,)).fetchone()[0])
 
 def perform(path, data):
+    if path == '/api/ingest':
+        return get_pipeline().ingest(int(data['project_id']), data['documents'])
+    if path in ('/api/reindex','/api/ask','/api/extract'):
+        pipeline=get_pipeline(); pid=int(data['project_id'])
+        if path == '/api/reindex': return pipeline.reindex(pid)
+        question=data.get('query','')
+        return pipeline.ask(pid,question) if path=='/api/ask' else pipeline.extract(pid,question)
     with connect() as db:
         if path == '/api/projects':
             planned = number(data,'planned',positive=True)
@@ -77,22 +109,8 @@ def perform(path, data):
             if completed>planned: raise ValueError('Completed baseline hours cannot exceed planned hours')
             db.execute('UPDATE projects SET completed=? WHERE id=?',(completed,pid))
             return {'ok':True}
-        if path == '/api/ingest':
-            docs=data['documents']
-            if not isinstance(docs,list) or not 1<=len(docs)<=20: raise ValueError('Upload 1–20 documents at a time')
-            with INGEST_LIMIT:
-                with ThreadPoolExecutor(max_workers=4) as pool:
-                    groups=list(pool.map(chunk_document,docs))
-            db.executemany('INSERT INTO chunks(project_id,source,position,text) VALUES(?,?,?,?)',[(pid,*row) for group in groups for row in group])
-            return {'chunks':sum(map(len,groups)), 'workers':4}
         if path == '/api/search':
-            terms=set(re.findall(r'\w+',str(data.get('query','')).lower()))
-            if not terms: raise ValueError('Enter a search question')
-            ranked=[]
-            for r in db.execute('SELECT * FROM chunks WHERE project_id=?',(pid,)):
-                item=dict(r); score=len(terms & set(re.findall(r'\w+',r['text'].lower())))
-                if score: item['score']=score; ranked.append(item)
-            return {'results':sorted(ranked,key=lambda x:x['score'],reverse=True)[:5]}
+            return {'results':get_pipeline().retrieve(pid,data.get('query',''))}
         if path == '/api/change':
             desc=str(data.get('description','')).strip()[:500]
             if not desc: raise ValueError('Describe the scope change')
@@ -112,6 +130,7 @@ class Handler(BaseHTTPRequestHandler):
     def reply(self,value,status=200):
         body=json.dumps(value).encode(); self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
+        if self.path=='/api/rag/status': return self.reply(get_pipeline().status())
         if self.path=='/':
             body=(ROOT/'index.html').read_bytes(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.end_headers(); self.wfile.write(body); return
         with connect() as db:
@@ -125,6 +144,8 @@ class Handler(BaseHTTPRequestHandler):
             size=int(self.headers.get('Content-Length',0))
             if not 0<size<=2_000_000: raise ValueError('Request must be under 2 MB')
             self.reply(perform(self.path,json.loads(self.rfile.read(size))))
+        except Unavailable as e: self.reply({'error':str(e)},503)
+        except InvalidGeneration as e: self.reply({'error':str(e)},502)
         except (ValueError,KeyError,TypeError,csv.Error) as e: self.reply({'error':str(e)},400)
         except Exception: self.reply({'error':'Internal error; check server console'},500); import traceback; traceback.print_exc()
 

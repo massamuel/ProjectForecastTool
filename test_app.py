@@ -1,13 +1,18 @@
 import tempfile, unittest
 from pathlib import Path
 import app
+from rag.config import Config
+from rag.pipeline import Pipeline
+from tests.helpers import FakeEmbedder, MemoryStore, FakeLLM
 
 class ForecastTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.old=app.DB; app.DB=Path(self.tmp.name)/'test.sqlite3'; app.init()
+        app._PIPELINE=Pipeline(Config(Path(self.tmp.name)/'vectors'),app.connect,app.DB,FakeEmbedder(),MemoryStore(),FakeLLM())
+        app._PIPELINE_KEY=str(app.DB.resolve())
         self.pid=app.perform('/api/demo',{})['id']
     def tearDown(self):
-        app.DB=self.old; self.tmp.cleanup()
+        app._PIPELINE=None; app.DB=self.old; self.tmp.cleanup()
     def forecast(self):
         with app.connect() as db: return app.forecast(db,self.pid)
     def test_pivot_requires_approval(self):
